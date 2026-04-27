@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 use sv_parser_error::Error;
 use sv_parser_parser::{pp_parser, Span, SpanInfo};
 use sv_parser_syntaxtree::{
-    IncludeCompilerDirective, Locate, NodeEvent, RefNode, SourceDescription, TextMacroUsage,
-    WhiteSpace,
+    IfdefDirective, IfndefDirective, IncludeCompilerDirective, Locate, NodeEvent, RefNode,
+    SourceDescription, TextMacroUsage, WhiteSpace,
 };
 use std::collections::hash_map::RandomState;
 
@@ -315,6 +315,22 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
             }
         }
         if skip {
+            // Even inside a skipped region, surface nested conditional
+            // chains so consumers (e.g. formatters) can still re-emit
+            // them. Bodies are unreachable, so all branches record as
+            // taken=false; we don't mutate skip_nodes or defines (the
+            // outer skip already covers the whole subtree).
+            if let NodeEvent::Enter(ref node) = n {
+                match node {
+                    RefNode::IfdefDirective(d) => {
+                        record_skipped_ifdef_chain(d, &s, path.as_ref(), &mut ret);
+                    }
+                    RefNode::IfndefDirective(d) => {
+                        record_skipped_ifndef_chain(d, &s, path.as_ref(), &mut ret);
+                    }
+                    _ => {}
+                }
+            }
             continue;
         }
 
@@ -952,6 +968,111 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
 
 fn locate_range(locate: &Locate) -> Range {
     Range::new(locate.offset, locate.offset + locate.len)
+}
+
+/// Record an `` `ifdef `` chain encountered inside an already-skipped
+/// region (e.g. nested inside an un-taken outer branch). All branches
+/// are unreachable, so they record as `taken: false`. Mirrors the
+/// in-emit IfdefDirective arm but skips the pp-text push and skip_node
+/// management — the outer skip already covers this whole subtree.
+fn record_skipped_ifdef_chain<P: AsRef<Path>>(
+    d: &IfdefDirective,
+    s: &str,
+    path: P,
+    ret: &mut PreprocessedText,
+) {
+    let chain_locate: Locate = d.try_into().unwrap();
+    let (_, ref keyword, ref ifid, ref ifbody, ref elsif, ref elsebody, _, _) = d.nodes;
+    let if_keyword_locate: Locate = keyword.try_into().unwrap();
+    let ifid_str = identifier(ifid.into(), s).unwrap_or_default();
+    let if_body_range = node_range(ifbody.into());
+
+    let mut branches: Vec<IfdefBranch> = Vec::new();
+    branches.push(IfdefBranch {
+        kind: IfdefBranchKind::Ifdef,
+        keyword_original_range: locate_range(&if_keyword_locate),
+        condition: Some(ifid_str),
+        body_original_range: if_body_range,
+        taken: false,
+    });
+    for (_, kw, eid, body) in elsif {
+        let kw_loc: Locate = kw.try_into().unwrap();
+        let cond = identifier(eid.into(), s).unwrap_or_default();
+        branches.push(IfdefBranch {
+            kind: IfdefBranchKind::Elsif,
+            keyword_original_range: locate_range(&kw_loc),
+            condition: Some(cond),
+            body_original_range: node_range(body.into()),
+            taken: false,
+        });
+    }
+    if let Some((_, kw, body)) = elsebody {
+        let kw_loc: Locate = kw.try_into().unwrap();
+        branches.push(IfdefBranch {
+            kind: IfdefBranchKind::Else,
+            keyword_original_range: locate_range(&kw_loc),
+            condition: None,
+            body_original_range: node_range(body.into()),
+            taken: false,
+        });
+    }
+    ret.push_directive(DirectiveSpan {
+        kind: DirectiveKind::IfdefChain,
+        original_path: PathBuf::from(path.as_ref()),
+        original_range: locate_range(&chain_locate),
+        pp_range: None,
+        detail: DirectiveDetail::IfdefChain(IfdefChain { branches }),
+    });
+}
+
+fn record_skipped_ifndef_chain<P: AsRef<Path>>(
+    d: &IfndefDirective,
+    s: &str,
+    path: P,
+    ret: &mut PreprocessedText,
+) {
+    let chain_locate: Locate = d.try_into().unwrap();
+    let (_, ref keyword, ref ifid, ref ifbody, ref elsif, ref elsebody, _, _) = d.nodes;
+    let if_keyword_locate: Locate = keyword.try_into().unwrap();
+    let ifid_str = identifier(ifid.into(), s).unwrap_or_default();
+    let if_body_range = node_range(ifbody.into());
+
+    let mut branches: Vec<IfdefBranch> = Vec::new();
+    branches.push(IfdefBranch {
+        kind: IfdefBranchKind::Ifndef,
+        keyword_original_range: locate_range(&if_keyword_locate),
+        condition: Some(ifid_str),
+        body_original_range: if_body_range,
+        taken: false,
+    });
+    for (_, kw, eid, body) in elsif {
+        let kw_loc: Locate = kw.try_into().unwrap();
+        let cond = identifier(eid.into(), s).unwrap_or_default();
+        branches.push(IfdefBranch {
+            kind: IfdefBranchKind::Elsif,
+            keyword_original_range: locate_range(&kw_loc),
+            condition: Some(cond),
+            body_original_range: node_range(body.into()),
+            taken: false,
+        });
+    }
+    if let Some((_, kw, body)) = elsebody {
+        let kw_loc: Locate = kw.try_into().unwrap();
+        branches.push(IfdefBranch {
+            kind: IfdefBranchKind::Else,
+            keyword_original_range: locate_range(&kw_loc),
+            condition: None,
+            body_original_range: node_range(body.into()),
+            taken: false,
+        });
+    }
+    ret.push_directive(DirectiveSpan {
+        kind: DirectiveKind::IfdefChain,
+        original_path: PathBuf::from(path.as_ref()),
+        original_range: locate_range(&chain_locate),
+        pp_range: None,
+        detail: DirectiveDetail::IfdefChain(IfdefChain { branches }),
+    });
 }
 
 /// Push a directive whose entire form is a single keyword line kept
