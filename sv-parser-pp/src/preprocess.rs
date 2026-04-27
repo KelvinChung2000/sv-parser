@@ -1,3 +1,7 @@
+use crate::directive::{
+    DirectiveDetail, DirectiveKind, DirectiveSpan, IfdefBranch, IfdefBranchKind, IfdefChain,
+    IncludeDirective, MacroDef, MacroDefArg, MacroUsage,
+};
 use crate::range::Range;
 use nom::combinator::all_consuming;
 use nom_greedyerror::error_position;
@@ -21,6 +25,7 @@ const RECURSIVE_LIMIT: usize = 64;
 pub struct PreprocessedText {
     text: String,
     origins: BTreeMap<Range, Origin>,
+    directives: Vec<DirectiveSpan>,
 }
 
 #[derive(Debug)]
@@ -34,6 +39,7 @@ impl PreprocessedText {
         PreprocessedText {
             text: String::new(),
             origins: BTreeMap::new(),
+            directives: Vec::new(),
         }
     }
 
@@ -61,6 +67,16 @@ impl PreprocessedText {
             origin.range.offset(base);
             self.origins.insert(range, origin);
         }
+        for mut dir in other.directives {
+            if let Some(ref mut r) = dir.pp_range {
+                r.offset(base);
+            }
+            self.directives.push(dir);
+        }
+    }
+
+    fn push_directive(&mut self, dir: DirectiveSpan) {
+        self.directives.push(dir);
     }
 
     pub fn text(&self) -> &str {
@@ -79,6 +95,14 @@ impl PreprocessedText {
         } else {
             None
         }
+    }
+
+    /// All compiler directives recovered during preprocessing, in source
+    /// order. Each entry preserves the directive's original-source span,
+    /// the post-preprocess range its expansion (if any) occupies, and
+    /// kind-specific metadata. See [`crate::directive`] for details.
+    pub fn directives(&self) -> &[DirectiveSpan] {
+        &self.directives
     }
 }
 
@@ -345,8 +369,7 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
             }
             NodeEvent::Enter(RefNode::ResetallCompilerDirective(x)) => {
                 let locate: Locate = x.try_into().unwrap();
-                let range = Range::new(locate.offset, locate.offset + locate.len);
-                ret.push(locate.str(&s), Some((path.as_ref(), range)));
+                record_plain_directive(&mut ret, &s, path.as_ref(), &locate, DirectiveKind::Resetall);
                 skip_whitespace = true;
             }
             NodeEvent::Leave(RefNode::ResetallCompilerDirective(_)) => {
@@ -354,8 +377,7 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
             }
             NodeEvent::Enter(RefNode::TimescaleCompilerDirective(x)) => {
                 let locate: Locate = x.try_into().unwrap();
-                let range = Range::new(locate.offset, locate.offset + locate.len);
-                ret.push(locate.str(&s), Some((path.as_ref(), range)));
+                record_plain_directive(&mut ret, &s, path.as_ref(), &locate, DirectiveKind::Timescale);
                 skip_whitespace = true;
             }
             NodeEvent::Leave(RefNode::TimescaleCompilerDirective(_)) => {
@@ -363,8 +385,7 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
             }
             NodeEvent::Enter(RefNode::DefaultNettypeCompilerDirective(x)) => {
                 let locate: Locate = x.try_into().unwrap();
-                let range = Range::new(locate.offset, locate.offset + locate.len);
-                ret.push(locate.str(&s), Some((path.as_ref(), range)));
+                record_plain_directive(&mut ret, &s, path.as_ref(), &locate, DirectiveKind::DefaultNettype);
                 skip_whitespace = true;
             }
             NodeEvent::Leave(RefNode::DefaultNettypeCompilerDirective(_)) => {
@@ -372,8 +393,7 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
             }
             NodeEvent::Enter(RefNode::UnconnectedDriveCompilerDirective(x)) => {
                 let locate: Locate = x.try_into().unwrap();
-                let range = Range::new(locate.offset, locate.offset + locate.len);
-                ret.push(locate.str(&s), Some((path.as_ref(), range)));
+                record_plain_directive(&mut ret, &s, path.as_ref(), &locate, DirectiveKind::UnconnectedDrive);
                 skip_whitespace = true;
             }
             NodeEvent::Leave(RefNode::UnconnectedDriveCompilerDirective(_)) => {
@@ -381,8 +401,7 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
             }
             NodeEvent::Enter(RefNode::NounconnectedDriveCompilerDirective(x)) => {
                 let locate: Locate = x.try_into().unwrap();
-                let range = Range::new(locate.offset, locate.offset + locate.len);
-                ret.push(locate.str(&s), Some((path.as_ref(), range)));
+                record_plain_directive(&mut ret, &s, path.as_ref(), &locate, DirectiveKind::UnconnectedDrive);
                 skip_whitespace = true;
             }
             NodeEvent::Leave(RefNode::NounconnectedDriveCompilerDirective(_)) => {
@@ -390,8 +409,7 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
             }
             NodeEvent::Enter(RefNode::CelldefineDriveCompilerDirective(x)) => {
                 let locate: Locate = x.try_into().unwrap();
-                let range = Range::new(locate.offset, locate.offset + locate.len);
-                ret.push(locate.str(&s), Some((path.as_ref(), range)));
+                record_plain_directive(&mut ret, &s, path.as_ref(), &locate, DirectiveKind::CellDefine);
                 skip_whitespace = true;
             }
             NodeEvent::Leave(RefNode::CelldefineDriveCompilerDirective(_)) => {
@@ -399,8 +417,7 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
             }
             NodeEvent::Enter(RefNode::EndcelldefineDriveCompilerDirective(x)) => {
                 let locate: Locate = x.try_into().unwrap();
-                let range = Range::new(locate.offset, locate.offset + locate.len);
-                ret.push(locate.str(&s), Some((path.as_ref(), range)));
+                record_plain_directive(&mut ret, &s, path.as_ref(), &locate, DirectiveKind::CellDefine);
                 skip_whitespace = true;
             }
             NodeEvent::Leave(RefNode::EndcelldefineDriveCompilerDirective(_)) => {
@@ -408,8 +425,7 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
             }
             NodeEvent::Enter(RefNode::Pragma(x)) => {
                 let locate: Locate = x.try_into().unwrap();
-                let range = Range::new(locate.offset, locate.offset + locate.len);
-                ret.push(locate.str(&s), Some((path.as_ref(), range)));
+                record_plain_directive(&mut ret, &s, path.as_ref(), &locate, DirectiveKind::Pragma);
                 skip_whitespace = true;
             }
             NodeEvent::Leave(RefNode::Pragma(_)) => {
@@ -417,8 +433,7 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
             }
             NodeEvent::Enter(RefNode::LineCompilerDirective(x)) => {
                 let locate: Locate = x.try_into().unwrap();
-                let range = Range::new(locate.offset, locate.offset + locate.len);
-                ret.push(locate.str(&s), Some((path.as_ref(), range)));
+                record_plain_directive(&mut ret, &s, path.as_ref(), &locate, DirectiveKind::Line);
                 skip_whitespace = true;
             }
             NodeEvent::Leave(RefNode::LineCompilerDirective(_)) => {
@@ -426,8 +441,7 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
             }
             NodeEvent::Enter(RefNode::KeywordsDirective(x)) => {
                 let locate: Locate = x.try_into().unwrap();
-                let range = Range::new(locate.offset, locate.offset + locate.len);
-                ret.push(locate.str(&s), Some((path.as_ref(), range)));
+                record_plain_directive(&mut ret, &s, path.as_ref(), &locate, DirectiveKind::Keywords);
                 skip_whitespace = true;
             }
             NodeEvent::Leave(RefNode::KeywordsDirective(_)) => {
@@ -435,8 +449,7 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
             }
             NodeEvent::Enter(RefNode::EndkeywordsDirective(x)) => {
                 let locate: Locate = x.try_into().unwrap();
-                let range = Range::new(locate.offset, locate.offset + locate.len);
-                ret.push(locate.str(&s), Some((path.as_ref(), range)));
+                record_plain_directive(&mut ret, &s, path.as_ref(), &locate, DirectiveKind::Keywords);
                 skip_whitespace = true;
             }
             NodeEvent::Leave(RefNode::EndkeywordsDirective(_)) => {
@@ -448,8 +461,7 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
                 defines.remove(&id);
 
                 let locate: Locate = x.try_into().unwrap();
-                let range = Range::new(locate.offset, locate.offset + locate.len);
-                ret.push(locate.str(&s), Some((path.as_ref(), range)));
+                record_plain_directive(&mut ret, &s, path.as_ref(), &locate, DirectiveKind::Undef);
                 skip_whitespace = true;
             }
             NodeEvent::Leave(RefNode::UndefineCompilerDirective(_)) => {
@@ -459,48 +471,90 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
                 defines.clear();
 
                 let locate: Locate = x.try_into().unwrap();
-                let range = Range::new(locate.offset, locate.offset + locate.len);
-                ret.push(locate.str(&s), Some((path.as_ref(), range)));
+                record_plain_directive(&mut ret, &s, path.as_ref(), &locate, DirectiveKind::UndefineAll);
                 skip_whitespace = true;
             }
             NodeEvent::Leave(RefNode::UndefineallCompilerDirective(_)) => {
                 skip_whitespace = false;
             }
             NodeEvent::Enter(RefNode::IfdefDirective(x)) => {
+                let chain_locate: Locate = x.try_into().unwrap();
                 let (_, ref keyword, ref ifid, ref ifbody, ref elsif, ref elsebody, _, _) = x.nodes;
+                let if_keyword_locate: Locate = keyword.try_into().unwrap();
                 skip_nodes.push(keyword.into());
                 skip_nodes.push(ifid.into());
 
                 let ifid = identifier(ifid.into(), &s).unwrap();
+                let if_body_range = node_range(ifbody.into());
                 let mut hit = false;
-                if defines.contains_key(&ifid) || is_predefined_text_macro(&ifid) {
+                let if_taken = defines.contains_key(&ifid) || is_predefined_text_macro(&ifid);
+                if if_taken {
                     hit = true;
                 } else {
                     skip_nodes.push(ifbody.into());
                 }
 
+                let mut branches: Vec<IfdefBranch> = Vec::new();
+                branches.push(IfdefBranch {
+                    kind: IfdefBranchKind::Ifdef,
+                    keyword_original_range: locate_range(&if_keyword_locate),
+                    condition: Some(ifid.clone()),
+                    body_original_range: if_body_range,
+                    taken: if_taken,
+                });
+
                 for x in elsif {
                     let (_, ref keyword, ref elsifid, ref elsifbody) = x;
+                    let elsif_keyword_locate: Locate = keyword.try_into().unwrap();
                     skip_nodes.push(keyword.into());
                     skip_nodes.push(elsifid.into());
 
-                    let elsifid = identifier(elsifid.into(), &s).unwrap();
+                    let elsifid_str = identifier(elsifid.into(), &s).unwrap();
+                    let elsif_body_range = node_range(elsifbody.into());
+                    let elsif_taken = !hit
+                        && (defines.contains_key(&elsifid_str)
+                            || is_predefined_text_macro(&ifid));
                     if hit {
                         skip_nodes.push(elsifbody.into());
-                    } else if defines.contains_key(&elsifid) || is_predefined_text_macro(&ifid) {
+                    } else if elsif_taken {
                         hit = true;
                     } else {
                         skip_nodes.push(elsifbody.into());
                     }
+                    branches.push(IfdefBranch {
+                        kind: IfdefBranchKind::Elsif,
+                        keyword_original_range: locate_range(&elsif_keyword_locate),
+                        condition: Some(elsifid_str),
+                        body_original_range: elsif_body_range,
+                        taken: elsif_taken,
+                    });
                 }
 
                 if let Some(elsebody) = elsebody {
                     let (_, ref keyword, ref elsebody) = elsebody;
+                    let else_keyword_locate: Locate = keyword.try_into().unwrap();
                     skip_nodes.push(keyword.into());
+                    let else_body_range = node_range(elsebody.into());
+                    let else_taken = !hit;
                     if hit {
                         skip_nodes.push(elsebody.into());
                     }
+                    branches.push(IfdefBranch {
+                        kind: IfdefBranchKind::Else,
+                        keyword_original_range: locate_range(&else_keyword_locate),
+                        condition: None,
+                        body_original_range: else_body_range,
+                        taken: else_taken,
+                    });
                 }
+
+                ret.push_directive(DirectiveSpan {
+                    kind: DirectiveKind::IfdefChain,
+                    original_path: PathBuf::from(path.as_ref()),
+                    original_range: locate_range(&chain_locate),
+                    pp_range: None,
+                    detail: DirectiveDetail::IfdefChain(IfdefChain { branches }),
+                });
             }
             NodeEvent::Enter(RefNode::WhiteSpace(x)) if !skip_whitespace && !strip_comments => {
                 if let WhiteSpace::Space(_) = x {
@@ -515,40 +569,83 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
                 ret.push(locate.str(&s), Some((path.as_ref(), range)));
             }
             NodeEvent::Enter(RefNode::IfndefDirective(x)) => {
+                let chain_locate: Locate = x.try_into().unwrap();
                 let (_, ref keyword, ref ifid, ref ifbody, ref elsif, ref elsebody, _, _) = x.nodes;
+                let if_keyword_locate: Locate = keyword.try_into().unwrap();
                 skip_nodes.push(keyword.into());
                 skip_nodes.push(ifid.into());
 
                 let ifid = identifier(ifid.into(), &s).unwrap();
+                let if_body_range = node_range(ifbody.into());
                 let mut hit = false;
-                if !defines.contains_key(&ifid) && !is_predefined_text_macro(&ifid) {
+                let if_taken = !defines.contains_key(&ifid) && !is_predefined_text_macro(&ifid);
+                if if_taken {
                     hit = true;
                 } else {
                     skip_nodes.push(ifbody.into());
                 }
 
+                let mut branches: Vec<IfdefBranch> = Vec::new();
+                branches.push(IfdefBranch {
+                    kind: IfdefBranchKind::Ifndef,
+                    keyword_original_range: locate_range(&if_keyword_locate),
+                    condition: Some(ifid.clone()),
+                    body_original_range: if_body_range,
+                    taken: if_taken,
+                });
+
                 for x in elsif {
                     let (_, ref keyword, ref elsifid, ref elsifbody) = x;
+                    let elsif_keyword_locate: Locate = keyword.try_into().unwrap();
                     skip_nodes.push(keyword.into());
                     skip_nodes.push(elsifid.into());
 
-                    let elsifid = identifier(elsifid.into(), &s).unwrap();
+                    let elsifid_str = identifier(elsifid.into(), &s).unwrap();
+                    let elsif_body_range = node_range(elsifbody.into());
+                    let elsif_taken = !hit
+                        && (defines.contains_key(&elsifid_str)
+                            || is_predefined_text_macro(&ifid));
                     if hit {
                         skip_nodes.push(elsifbody.into());
-                    } else if defines.contains_key(&elsifid) || is_predefined_text_macro(&ifid) {
+                    } else if elsif_taken {
                         hit = true;
                     } else {
                         skip_nodes.push(elsifbody.into());
                     }
+                    branches.push(IfdefBranch {
+                        kind: IfdefBranchKind::Elsif,
+                        keyword_original_range: locate_range(&elsif_keyword_locate),
+                        condition: Some(elsifid_str),
+                        body_original_range: elsif_body_range,
+                        taken: elsif_taken,
+                    });
                 }
 
                 if let Some(elsebody) = elsebody {
                     let (_, ref keyword, ref elsebody) = elsebody;
+                    let else_keyword_locate: Locate = keyword.try_into().unwrap();
                     skip_nodes.push(keyword.into());
+                    let else_body_range = node_range(elsebody.into());
+                    let else_taken = !hit;
                     if hit {
                         skip_nodes.push(elsebody.into());
                     }
+                    branches.push(IfdefBranch {
+                        kind: IfdefBranchKind::Else,
+                        keyword_original_range: locate_range(&else_keyword_locate),
+                        condition: None,
+                        body_original_range: else_body_range,
+                        taken: else_taken,
+                    });
                 }
+
+                ret.push_directive(DirectiveSpan {
+                    kind: DirectiveKind::IfdefChain,
+                    original_path: PathBuf::from(path.as_ref()),
+                    original_range: locate_range(&chain_locate),
+                    pp_range: None,
+                    detail: DirectiveDetail::IfdefChain(IfdefChain { branches }),
+                });
             }
             NodeEvent::Enter(RefNode::TextMacroDefinition(x)) => {
                 skip_nodes.push(x.into());
@@ -558,28 +655,38 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
                 let (ref name, ref args) = proto.nodes;
                 let id = identifier(name.into(), &s).unwrap();
 
-                if !is_predefined_text_macro(id.as_str()) {
-                    let mut define_args = Vec::new();
-                    if let Some(args) = args {
-                        let (_, ref args, _) = args.nodes;
-                        let (ref args,) = args.nodes;
-                        for arg in args.contents() {
-                            let (ref arg, ref default) = arg.nodes;
-                            let (ref arg, _) = arg.nodes;
-                            let arg = String::from(arg.str(&s));
+                let mut directive_args: Vec<MacroDefArg> = Vec::new();
+                let mut define_args: Vec<(String, Option<String>)> = Vec::new();
+                if let Some(args) = args {
+                    let (_, ref args, _) = args.nodes;
+                    let (ref args,) = args.nodes;
+                    for arg in args.contents() {
+                        let (ref arg, ref default) = arg.nodes;
+                        let (ref arg, _) = arg.nodes;
+                        let arg = String::from(arg.str(&s));
 
-                            let default = if let Some((_, x)) = default {
-                                let x: Locate = x.try_into().unwrap();
-                                let x = String::from(x.str(&s));
-                                Some(x)
-                            } else {
-                                None
-                            };
+                        let default = if let Some((_, x)) = default {
+                            let x: Locate = x.try_into().unwrap();
+                            let x = String::from(x.str(&s));
+                            Some(x)
+                        } else {
+                            None
+                        };
 
-                            define_args.push((arg, default));
-                        }
+                        directive_args.push(MacroDefArg {
+                            name: arg.clone(),
+                            default: default.clone(),
+                        });
+                        define_args.push((arg, default));
                     }
+                }
 
+                let body_original_range = text.as_ref().map(|t| {
+                    let t_loc: Locate = t.try_into().unwrap();
+                    locate_range(&t_loc)
+                });
+
+                if !is_predefined_text_macro(id.as_str()) {
                     let define_text = if let Some(text) = text {
                         let text: Locate = text.try_into().unwrap();
                         let range = Range::new(text.offset, text.offset + text.len);
@@ -598,19 +705,33 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
                         text: define_text,
                     };
 
-                    defines.insert(id, Some(define));
+                    defines.insert(id.clone(), Some(define));
                 }
 
                 // Keep TextMacroDefinition after preprocess_inner().
                 let locate: Locate = x.try_into().unwrap();
                 let range = Range::new(locate.offset, locate.offset + locate.len);
+                let pp_begin = ret.text.len();
                 ret.push(locate.str(&s), Some((path.as_ref(), range)));
+                ret.push_directive(DirectiveSpan {
+                    kind: DirectiveKind::Define,
+                    original_path: PathBuf::from(path.as_ref()),
+                    original_range: range,
+                    pp_range: Some(Range::new(pp_begin, ret.text.len())),
+                    detail: DirectiveDetail::Define(MacroDef {
+                        name: id,
+                        arguments: directive_args,
+                        body_original_range,
+                    }),
+                });
             }
             NodeEvent::Enter(RefNode::IncludeCompilerDirective(x)) if !ignore_include => {
                 skip_nodes.push(x.into());
                 skip = true;
 
                 let locate: Locate = x.try_into().unwrap();
+                let parent_path: PathBuf = PathBuf::from(path.as_ref());
+                let directive_range = locate_range(&locate);
                 last_include_line = Some(locate.line);
 
                 // IEEE1800-2017 Clause 22.4, page 675
@@ -684,6 +805,8 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
                     }
                 }
 
+                let included_path = path.clone();
+                let pp_begin = ret.text.len();
                 let (include, new_defines) =
                     preprocess_inner(
                         path,
@@ -698,10 +821,30 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
                     )?;
                 defines = new_defines;
                 ret.merge(include);
+                let pp_end = ret.text.len();
+                ret.push_directive(DirectiveSpan {
+                    kind: DirectiveKind::Include,
+                    original_path: parent_path,
+                    original_range: directive_range,
+                    pp_range: if pp_end > pp_begin {
+                        Some(Range::new(pp_begin, pp_end))
+                    } else {
+                        None
+                    },
+                    detail: DirectiveDetail::Include(IncludeDirective { included_path }),
+                });
             }
             NodeEvent::Enter(RefNode::TextMacroUsage(x)) => {
                 skip_nodes.push(x.into());
                 skip = true;
+
+                let usage_locate: Locate = x.try_into().unwrap();
+                let usage_range = locate_range(&usage_locate);
+                let usage_text = String::from(usage_locate.str(&s));
+                let (_, ref usage_name_node, _) = x.nodes;
+                let usage_name = identifier((&usage_name_node.nodes.0).into(), &s)
+                    .unwrap_or_default();
+                let pp_begin = ret.text.len();
 
                 if let Some((text, origin, new_defines)) = resolve_text_macro_usage(
                     x,
@@ -715,6 +858,7 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
                     ret.push(&text, origin);
                     defines = new_defines;
                 }
+                let pp_end_after_expansion = ret.text.len();
 
                 // Push the trailing whitespace attached to either
                 // TextMacroIdentifier or Option<Paren<ListOfActualArguments>>.
@@ -749,31 +893,106 @@ pub fn preprocess_str<T: AsRef<Path>, U: AsRef<Path>, V: BuildHasher>(
                         }
                     }
                 }
+                ret.push_directive(DirectiveSpan {
+                    kind: DirectiveKind::MacroUsage,
+                    original_path: PathBuf::from(path.as_ref()),
+                    original_range: usage_range,
+                    pp_range: if pp_end_after_expansion > pp_begin {
+                        Some(Range::new(pp_begin, pp_end_after_expansion))
+                    } else {
+                        None
+                    },
+                    detail: DirectiveDetail::MacroUsage(MacroUsage {
+                        name: usage_name,
+                        call_text: usage_text,
+                    }),
+                });
             }
             NodeEvent::Enter(RefNode::PositionCompilerDirective(x)) => {
                 skip_nodes.push(x.into());
                 skip = true;
 
-                let (_, ref x) = x.nodes;
-                let locate: Locate = x.try_into().unwrap();
-                let x = locate.str(s);
-                if x.starts_with("__FILE__") {
+                let (_, ref pos_node) = x.nodes;
+                let locate: Locate = pos_node.try_into().unwrap();
+                let directive_range = locate_range(&locate);
+                let body = locate.str(s);
+                let pp_begin = ret.text.len();
+                if body.starts_with("__FILE__") {
                     ret.push::<PathBuf>(
-                        &x.replace(
+                        &body.replace(
                             "__FILE__",
                             &format!("\"{}\"", path.as_ref().to_string_lossy()),
                         ),
                         None,
                     );
-                } else if x.starts_with("__LINE__") {
-                    ret.push::<PathBuf>(&x.replace("__LINE__", &format!("{}", locate.line)), None);
+                } else if body.starts_with("__LINE__") {
+                    ret.push::<PathBuf>(
+                        &body.replace("__LINE__", &format!("{}", locate.line)),
+                        None,
+                    );
                 }
+                ret.push_directive(DirectiveSpan {
+                    kind: DirectiveKind::PositionMacro,
+                    original_path: PathBuf::from(path.as_ref()),
+                    original_range: directive_range,
+                    pp_range: if ret.text.len() > pp_begin {
+                        Some(Range::new(pp_begin, ret.text.len()))
+                    } else {
+                        None
+                    },
+                    detail: DirectiveDetail::Plain,
+                });
             }
             _ => (),
         }
     }
 
     Ok((ret, defines))
+}
+
+fn locate_range(locate: &Locate) -> Range {
+    Range::new(locate.offset, locate.offset + locate.len)
+}
+
+/// Push a directive whose entire form is a single keyword line kept
+/// verbatim in the post-preprocess text (`` `pragma ``, `` `timescale ``,
+/// `` `default_nettype ``, `` `undef ``, …). Wraps the existing
+/// [`PreprocessedText::push`] so the post-pp range is captured exactly
+/// over the bytes the directive contributes.
+fn record_plain_directive<P: AsRef<Path>>(
+    ret: &mut PreprocessedText,
+    src: &str,
+    path: P,
+    locate: &Locate,
+    kind: DirectiveKind,
+) {
+    let range = locate_range(locate);
+    let pp_begin = ret.text.len();
+    ret.push(locate.str(src), Some((path.as_ref(), range)));
+    ret.push_directive(DirectiveSpan {
+        kind,
+        original_path: PathBuf::from(path.as_ref()),
+        original_range: range,
+        pp_range: Some(Range::new(pp_begin, ret.text.len())),
+        detail: DirectiveDetail::Plain,
+    });
+}
+
+/// Span covering every `Locate` in a subtree, from the first byte of
+/// the earliest leaf to the last byte of the latest leaf. Returns
+/// `None` when the subtree contains no `Locate` leaves.
+fn node_range(node: RefNode) -> Option<Range> {
+    let mut beg: Option<usize> = None;
+    let mut end: usize = 0;
+    for x in node {
+        if let RefNode::Locate(loc) = x {
+            if beg.is_none() {
+                beg = Some(loc.offset);
+            }
+            end = loc.offset + loc.len;
+        }
+    }
+    beg.map(|b| Range::new(b, end))
 }
 
 fn identifier(node: RefNode, s: &str) -> Option<String> {
@@ -1638,5 +1857,157 @@ mod tests {
             ret.text(),
             testfile_contents("expected/undefineall.sv")
         );
+    } // }}}
+
+    // -------------------------------------------------------------------
+    // Directive-span smoke tests. The existing `text()` round-trip tests
+    // (above) prove the patch is additive — none of them break. These
+    // assert the new `directives()` accessor surfaces the structured
+    // metadata.
+    // -------------------------------------------------------------------
+
+    fn preprocess_str_for_dir(src: &str) -> PreprocessedText {
+        let path = PathBuf::from("test.sv");
+        let (pp, _) = preprocess_str(
+            src,
+            &path,
+            &HashMap::new() as &Defines,
+            &[] as &[String],
+            false, // ignore_include
+            false, // strip_comments
+            0,     // resolve_depth
+            0,     // include_depth
+        )
+        .unwrap();
+        pp
+    }
+
+    #[test]
+    fn directives_define_records_name_args_body() { // {{{
+        let src = "`define ASSERT(expr) empty_statement\nmodule m; endmodule\n";
+        let pp = preprocess_str_for_dir(src);
+        let defines: Vec<&DirectiveSpan> = pp
+            .directives()
+            .iter()
+            .filter(|d| d.kind == DirectiveKind::Define)
+            .collect();
+        assert_eq!(defines.len(), 1);
+        let DirectiveDetail::Define(ref m) = defines[0].detail else {
+            panic!("expected Define detail");
+        };
+        assert_eq!(m.name, "ASSERT");
+        assert_eq!(m.arguments.len(), 1);
+        assert_eq!(m.arguments[0].name, "expr");
+        assert!(m.body_original_range.is_some());
+        // Define line is preserved verbatim in the post-pp text.
+        assert!(defines[0].pp_range.is_some());
+    } // }}}
+
+    #[test]
+    fn directives_macro_usage_records_call_text_and_pp_range() { // {{{
+        let src = "\
+`define ASSERT(expr) empty_statement
+module m;
+  task empty_statement; endtask
+  initial if (cond) `ASSERT(p == q);
+endmodule
+";
+        let pp = preprocess_str_for_dir(src);
+        let usages: Vec<&DirectiveSpan> = pp
+            .directives()
+            .iter()
+            .filter(|d| d.kind == DirectiveKind::MacroUsage)
+            .collect();
+        assert_eq!(usages.len(), 1, "exactly one macro use site");
+        let DirectiveDetail::MacroUsage(ref u) = usages[0].detail else {
+            panic!("expected MacroUsage detail");
+        };
+        assert_eq!(u.name, "ASSERT");
+        assert!(u.call_text.starts_with("`ASSERT"));
+        // Expansion lands in the post-pp text — that's what consumers map.
+        let r = usages[0].pp_range.expect("expansion has a pp range");
+        let expansion = &pp.text()[r.begin..r.end];
+        assert!(
+            expansion.contains("empty_statement"),
+            "expansion: {:?}",
+            expansion
+        );
+    } // }}}
+
+    #[test]
+    fn directives_ifdef_chain_marks_taken_branches() { // {{{
+        // Predefine FOO so the ifdef branch is taken.
+        let src = "\
+`ifdef FOO
+module taken;
+endmodule
+`elsif BAR
+module elsif_branch;
+endmodule
+`else
+module fallback;
+endmodule
+`endif
+";
+        let path = PathBuf::from("test.sv");
+        let mut defines: Defines = HashMap::new();
+        defines.insert(String::from("FOO"), None);
+        let (pp, _) = preprocess_str(
+            src,
+            &path,
+            &defines,
+            &[] as &[String],
+            false,
+            false,
+            0,
+            0,
+        )
+        .unwrap();
+        let chains: Vec<&DirectiveSpan> = pp
+            .directives()
+            .iter()
+            .filter(|d| d.kind == DirectiveKind::IfdefChain)
+            .collect();
+        assert_eq!(chains.len(), 1);
+        let DirectiveDetail::IfdefChain(ref c) = chains[0].detail else {
+            panic!("expected IfdefChain detail");
+        };
+        assert_eq!(c.branches.len(), 3);
+        assert_eq!(c.branches[0].kind, IfdefBranchKind::Ifdef);
+        assert_eq!(c.branches[0].condition.as_deref(), Some("FOO"));
+        assert!(c.branches[0].taken);
+        assert_eq!(c.branches[1].kind, IfdefBranchKind::Elsif);
+        assert!(!c.branches[1].taken);
+        assert_eq!(c.branches[2].kind, IfdefBranchKind::Else);
+        assert!(!c.branches[2].taken);
+        // The chain itself contributes nothing to pp text; only its
+        // taken branch's body does.
+        assert!(chains[0].pp_range.is_none());
+    } // }}}
+
+    #[test]
+    fn directives_plain_kinds_recorded() { // {{{
+        let src = "\
+`timescale 1ns/1ps
+`default_nettype none
+`pragma protect
+module m; endmodule
+`default_nettype wire
+";
+        let pp = preprocess_str_for_dir(src);
+        let kinds: Vec<DirectiveKind> = pp
+            .directives()
+            .iter()
+            .map(|d| d.kind)
+            .collect();
+        assert!(kinds.contains(&DirectiveKind::Timescale));
+        assert!(kinds.contains(&DirectiveKind::DefaultNettype));
+        assert!(kinds.contains(&DirectiveKind::Pragma));
+        // Two `default_nettype` directives in source order.
+        let nettype_count = kinds
+            .iter()
+            .filter(|k| **k == DirectiveKind::DefaultNettype)
+            .count();
+        assert_eq!(nettype_count, 2);
     } // }}}
 }

@@ -8,9 +8,14 @@ pub use sv_parser_error::Error;
 use sv_parser_parser::{
     lib_parser, lib_parser_incomplete, sv_parser, sv_parser_incomplete, Span, SpanInfo,
 };
+pub use sv_parser_pp::directive::{
+    DirectiveDetail, DirectiveKind, DirectiveSpan, IfdefBranch, IfdefBranchKind, IfdefChain,
+    IncludeDirective, MacroDef, MacroDefArg, MacroUsage,
+};
 pub use sv_parser_pp::preprocess::{
     preprocess, preprocess_str, Define, DefineText, Defines, PreprocessedText,
 };
+pub use sv_parser_pp::range::Range as PpRange;
 pub use sv_parser_syntaxtree::*;
 
 pub struct SyntaxTree {
@@ -72,6 +77,12 @@ impl SyntaxTree {
     /// Get source code location of the specified `Locate`
     pub fn get_origin(&self, locate: &Locate) -> Option<(&PathBuf, usize)> {
         self.text.origin(locate.offset)
+    }
+
+    /// Compiler directives recovered during preprocessing, in source
+    /// order. See [`sv_parser_pp::directive`] for the full layout.
+    pub fn directives(&self) -> &[DirectiveSpan] {
+        self.text.directives()
     }
 }
 
